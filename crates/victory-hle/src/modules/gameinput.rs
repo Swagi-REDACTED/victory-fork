@@ -1292,6 +1292,10 @@ mod host {
                     .map(super::key_code)
                     .collect::<Option<Vec<u8>>>()?
             };
+            if !codes.is_empty() && ms == 0 {
+                // A press held 0 ms could never be seen by the title.
+                return None;
+            }
             Some((codes, Duration::from_millis(ms)))
         }
 
@@ -1336,26 +1340,59 @@ mod host {
             Some(Mutex::new(Queue::default()))
         });
 
+        /// Appends `fresh` to `partial` (the bytes read so far that do not
+        /// end a line yet) and takes out the complete lines.
+        pub(super) fn complete_lines(partial: &mut Vec<u8>, fresh: &[u8]) -> Vec<String> {
+            partial.extend_from_slice(fresh);
+            let Some(end) = partial.iter().rposition(|&b| b == b'\n') else {
+                return Vec::new();
+            };
+            let lines = String::from_utf8_lossy(&partial[..end])
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            partial.drain(..=end);
+            lines
+        }
+
         /// Reads what is appended to `path` from byte `offset` on, every
-        /// 100 ms, and queues each complete line.
+        /// 100 ms (only the new bytes), and queues each complete line. The
+        /// file is append-only: emptying it, or replacing it with a shorter
+        /// one, starts over from its beginning; a longer replacement between
+        /// two looks is read from the old offset on, as if appended.
         fn follow(path: &std::path::Path, mut offset: u64) {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut partial = Vec::new();
             loop {
                 std::thread::sleep(Duration::from_millis(100));
-                let Ok(text) = std::fs::read(path) else {
+                let Ok(mut file) = std::fs::File::open(path) else {
                     continue;
                 };
-                if (text.len() as u64) < offset {
-                    // The file was emptied: start over from its beginning.
+                let Ok(len) = file.metadata().map(|m| m.len()) else {
+                    continue;
+                };
+                if len < offset {
                     offset = 0;
+                    partial.clear();
                 }
-                let fresh = &text[offset as usize..];
-                let Some(end) = fresh.iter().rposition(|&b| b == b'\n') else {
+                if len == offset {
                     continue;
-                };
-                offset += end as u64 + 1;
+                }
+                let mut fresh = Vec::new();
+                if file.seek(SeekFrom::Start(offset)).is_err()
+                    || file.take(len - offset).read_to_end(&mut fresh).is_err()
+                {
+                    continue;
+                }
+                offset += fresh.len() as u64;
+                let lines = complete_lines(&mut partial, &fresh);
+                if lines.is_empty() {
+                    continue;
+                }
                 let Some(queue) = QUEUE.as_ref() else { return };
                 let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
-                for line in String::from_utf8_lossy(&fresh[..end]).lines() {
+                for line in &lines {
+                    let line = line.as_str();
                     match parse(line) {
                         Some((keys, hold)) => {
                             tracing::info!(line, "VICTORY_KEYS_LIVE: pressed");
@@ -1401,6 +1438,41 @@ mod host {
                     "an unknown key is not pressed as nothing"
                 );
                 assert_eq!(parse("Enter:soon"), None);
+                assert_eq!(
+                    parse("Enter:0"),
+                    None,
+                    "a press held 0 ms could never be seen"
+                );
+                assert_eq!(parse("wait:0"), Some((vec![], ms(0))));
+            }
+
+            #[test]
+            fn polls_far_apart_lose_no_press() {
+                // However long between two polls, each press is seen by one
+                // poll at least, in order.
+                let t = Instant::now();
+                let ms = Duration::from_millis;
+                let mut q = Queue::default();
+                for vk in [0x0D, 0x28, b'W'] {
+                    q.push(vec![vk], ms(200));
+                }
+                let seen: Vec<Vec<u8>> = (0..6)
+                    .map(|i| q.held(t + ms(10_000 * i)))
+                    .filter(|k| !k.is_empty())
+                    .collect();
+                assert_eq!(seen, [vec![0x0D], vec![0x28], vec![b'W']]);
+            }
+
+            #[test]
+            fn lines_are_taken_only_once_complete() {
+                let mut partial = Vec::new();
+                assert_eq!(complete_lines(&mut partial, b"Enter\nDo"), ["Enter"]);
+                assert_eq!(partial, b"Do", "the incomplete line waits");
+                assert_eq!(
+                    complete_lines(&mut partial, b"wn:300\r\nwait:5\n"),
+                    ["Down:300", "wait:5"]
+                );
+                assert!(partial.is_empty());
             }
 
             #[test]
