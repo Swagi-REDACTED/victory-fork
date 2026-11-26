@@ -815,6 +815,10 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+For controller input, `VICTORY_LOG=victory_hle::modules::gameinput=trace,info`
+logs the requested reading kinds and the gamepad buttons, triggers and sticks
+returned to the title. This includes values supplied by scripted input.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

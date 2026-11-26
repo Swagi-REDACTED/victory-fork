@@ -1034,6 +1034,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
+            tracing::trace!(sequence = reading(this).sequence, ?state, "gamepad state read");
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
             true
