@@ -469,6 +469,29 @@ fn expected(scene: &Scene, case: &Case, sort: bool) -> [u32; 4] {
     }
 }
 
+/// What the instruction gives while no structure is built
+/// ([`super::USER_STRUCTURES`] 0): a box node no child, any other node a
+/// triangle missed.
+fn absent(case: &Case) -> [u32; 4] {
+    match case {
+        Some((_, 4 | 5, _)) => [bvh::NONE; 4],
+        Some(_) => bvh::MISS.map(f32::to_bits),
+        None => BEFORE,
+    }
+}
+
+/// The program's user data: zeros (its table is at heap slot 0), and
+/// whether the structures are `built` ([`super::USER_STRUCTURES`]).
+fn constants(shader: &HostShader, built: bool) -> Vec<u32> {
+    let mut values = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        if u.root == RootType::Other(super::USER_STRUCTURES) {
+            values[u.index as usize] = u32::from(built);
+        }
+    }
+    values
+}
+
 /// Sets the tests' title memory for this thread until dropped.
 struct Memory;
 
@@ -490,6 +513,12 @@ impl Drop for Memory {
 /// the reference. `pointers` is what node pointers count from, in bytes
 /// before the first node.
 fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
+    run_built(wide, descriptor, pointers, sort, true);
+}
+
+/// [`run`], with the structures `built` or not ([`super::USER_STRUCTURES`];
+/// if not, every result is [`absent`]).
+fn run_built(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool, built: bool) {
     let (shader, res) = build(wide, descriptor).expect("the program lowers");
     assert_eq!(res.bvh.len(), 1);
     let (scene, batches) = scene();
@@ -547,7 +576,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        roots: vec![(0, Root::Constants(constants(&shader, built)))],
                         views: &[
                             View::Buffer {
                                 data: &data,
@@ -563,7 +592,8 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
                 let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
+                    Some(c) if built => expected(&scene, c, sort),
+                    Some(c) => absent(c),
                     // A thread past the batch: its record is zeros, so it
                     // is masked out.
                     None => BEFORE,
@@ -630,6 +660,18 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
 }
 
 #[test]
+fn with_no_structure_built_every_node_test_answers_no_hit_on_the_card() {
+    // USER_STRUCTURES 0 (the structure builder does not run): a box node
+    // enters no child and any other node is missed, over title memory and
+    // in a host buffer alike; threads masked out keep their registers.
+    {
+        let _memory = Memory::at(BASE);
+        run_built(true, WHOLE, BASE + u64::from(NODES), true, false);
+    }
+    run_built(false, Descriptor::Table, u64::from(NODES), true, false);
+}
+
+#[test]
 fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     for wide in [true, false] {
         let native = native(&program(wide, WHOLE));
@@ -655,6 +697,13 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
         assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
         assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+        // And whether there are structures to read at all.
+        assert!(
+            shader
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(super::USER_STRUCTURES))
+        );
     }
 }
 
@@ -705,5 +754,85 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
             assert_eq!(what, "a ray-tracing structure that returns triangle ids");
         }
         other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn disabled_structures_leave_the_page_fault_buffer_untouched() {
+    // Box32 at page 11 of an empty directory. Only the address and the
+    // execution mask matter here. The actual node has no backing copy.
+    const PAGE: u32 = 11;
+    const MARKER: u32 = 0xabcd_ef01;
+    let (shader, _) = build(true, WHOLE).expect("the title-memory program lowers");
+    let mut records = vec![0; (NODES / 4) as usize];
+    for record in records.chunks_exact_mut((RECORD / 4) as usize) {
+        record[0] = (PAGE << 13) | 5;
+        record[12] = 1;
+    }
+    let base = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_MEMORY_BASE))
+        .expect("base slot for the title-memory views")
+        .index as usize;
+    let mut initial = vec![0; super::MEMORY_FAULTS as usize];
+    initial[0] = MARKER;
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("WARP", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline_bounded(&shader)
+            .expect("compute pipeline");
+        for built in [false, true] {
+            let mut args = constants(&shader, built);
+            args[base] = 2;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(args)),
+                            (1, Root::Uav(initial.clone())),
+                            (
+                                2,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![0; ((PAGE + 1) * 2) as usize],
+                                },
+                            ),
+                        ],
+                        views: &[
+                            View::Buffer {
+                                data: &records,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(4 * THREADS),
+                            View::RawUav(32),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("BVH dispatch");
+            let faults = out.last().expect("root fault UAV");
+            if built {
+                assert_eq!(
+                    faults[1 + PAGE as usize],
+                    PAGE,
+                    "missing page was requested"
+                );
+            } else {
+                assert!(out[0].iter().all(|&child| child == bvh::NONE));
+                assert_eq!(faults[0], MARKER, "disabled traversal wrote the fault sink");
+                assert_eq!(faults, &initial);
+            }
+        }
     }
 }
