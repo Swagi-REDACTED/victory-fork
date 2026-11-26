@@ -541,7 +541,9 @@ fn host() -> Box<dyn Source> {
 /// the stand-in there throughout a scripted run, including gaps between keys.
 fn fallback_slot() -> usize {
     #[cfg(all(windows, feature = "diagnostics"))]
-    if !host::schedule().is_empty() {
+    if !host::schedule().is_empty()
+        || std::env::var_os("VICTORY_KEYS_LIVE").is_some_and(|path| !path.is_empty())
+    {
         return 0;
     }
     FALLBACK
@@ -1359,7 +1361,9 @@ mod host {
         }
 
         static QUEUE: LazyLock<Option<Mutex<Queue>>> = LazyLock::new(|| {
-            let path = std::path::PathBuf::from(std::env::var_os("VICTORY_KEYS_LIVE")?);
+            let path = std::path::PathBuf::from(
+                std::env::var_os("VICTORY_KEYS_LIVE").filter(|path| !path.is_empty())?
+            );
             let start = std::fs::metadata(&path).map_or(0, |m| m.len());
             std::thread::Builder::new()
                 .name("keys-live".into())
@@ -1770,6 +1774,27 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn live_keys_keep_slot_zero_without_a_timed_schedule() {
+        const CHILD: &str = "VICTORY_TEST_LIVE_PAD_SLOT";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for mode in ["absent", "empty", "configured"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
+                    .env(CHILD, mode)
+                    .env_remove("VICTORY_KEYS")
+                    .env_remove("VICTORY_KEYS_LIVE");
+                if mode != "absent" {
+                    command.env("VICTORY_KEYS_LIVE", if mode == "empty" { "" } else { "synthetic-input.txt" });
+                }
+                assert!(command.status().unwrap().success(), "{mode}");
+            }
+            return;
+        };
+        assert_eq!(fallback_slot(), if mode == "configured" { 0 } else { FALLBACK });
     }
 
     #[test]
